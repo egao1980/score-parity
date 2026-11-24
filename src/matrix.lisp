@@ -37,15 +37,70 @@
 (defun parity-matrix (&key (pieces (corpus-pieces)) (checks (mapcar #'first +checks+))
                         (musescore (find-musescore)) (schema (musicxml-schema)))
   "Every check of CHECKS on every piece of PIECES it applies to (file header)."
-  (declare (ignore pieces checks musescore schema))
-  (%sc5-pending 'parity-matrix))
+  ;; The defaults are evaluated once per call: each tool is looked up once.
+  (loop for check in checks
+        for keys = (case check
+                     (:musescore (list :musescore musescore))
+                     (:xsd (list :schema schema))
+                     (t '()))
+        nconc (loop for piece in pieces
+                    when (check-applies-p check piece)
+                      collect (apply #'run-check check piece keys))))
+
+(defun %result-checks (results)
+  "The checks that occur in RESULTS, in +CHECKS+ order."
+  (loop for (check) in +checks+
+        when (find check results :key #'parity-result-check)
+          collect check))
+
+(defun %check-label (check)
+  "CHECK's :LABEL in +CHECKS+."
+  (or (getf (cdr (assoc check +checks+)) :label)
+      (string-downcase (princ-to-string check))))
 
 (defun matrix-cells (results &key (features +features+))
   "Per feature, then :ALL, the counts of RESULTS per check and status (file header)."
-  (declare (ignore results features))
-  (%sc5-pending 'matrix-cells))
+  (let ((checks (%result-checks results))
+        ;; Each result with its piece's features, looked up once.
+        (tagged (mapcar (lambda (result)
+                          (cons result (piece-features (parity-result-piece result))))
+                        results)))
+    (flet ((row (label row-results)
+             (cons label
+                   (loop for check in checks
+                         for mine = (remove-if-not (lambda (result)
+                                                     (eq check (parity-result-check result)))
+                                                   row-results)
+                         collect (cons check
+                                       (loop for status in '(:pass :fail :error :skip)
+                                             collect (count status mine
+                                                            :key #'parity-result-status)))))))
+      (append (loop for feature in features
+                    collect (row feature
+                                 (loop for (result . features-of-piece) in tagged
+                                       when (member feature features-of-piece)
+                                         collect result)))
+              (list (row :all results))))))
+
+(defun %cell-text (cell)
+  "\"P/N\", \"skip\" or \"-\" for the cell (CHECK PASS FAIL ERROR SKIP) (file header)."
+  (destructuring-bind (pass fail errors skip) (rest cell)
+    (let ((n (+ pass fail errors)))
+      (cond ((plusp n) (format nil "~D/~D" pass n))
+            ((plusp skip) "skip")
+            (t "-")))))
 
 (defun print-matrix (&optional (results (parity-matrix)) (stream *standard-output*))
   "Write the matrix of RESULTS to STREAM; RESULTS (file header)."
-  (declare (ignore results stream))
-  (%sc5-pending 'print-matrix))
+  (flet ((line (control &rest arguments)
+           (write-line (string-right-trim " " (apply #'format nil control arguments)) stream)))
+    (line "~15A~{~13A~}" "feature" (mapcar #'%check-label (%result-checks results)))
+    (dolist (row (matrix-cells results))
+      (line "~15A~{~13A~}" (string-downcase (symbol-name (first row)))
+            (mapcar #'%cell-text (rest row))))
+    (dolist (result results)
+      (when (member (parity-result-status result) '(:fail :error))
+        (line "~A ~A ~(~A~): ~A" (%check-label (parity-result-check result))
+              (parity-result-piece result) (parity-result-status result)
+              (parity-result-reason result)))))
+  results)

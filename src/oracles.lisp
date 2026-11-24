@@ -58,23 +58,69 @@
 (defparameter +musescore-names+ '("mscore" "musescore" "MuseScore4" "mscore4")
   "The executable names FIND-MUSESCORE looks for on PATH, in order. Data.")
 
+(defun %file-p (pathname)
+  "True when PATHNAME names an existing file that isn't a directory. Always a
+pathname: cl-stack-pathlib reads a string designator as a path text."
+  (cl-stack-pathlib:file-p pathname))
+
 (defun find-musescore (&key (bin (uiop:getenv "MUSESCORE_BIN")) (path (uiop:getenv "PATH")))
   "The MuseScore executable to use, or NIL (file header)."
-  (declare (ignore bin path))
-  (%sc5-pending 'find-musescore))
+  (if (and (stringp bin) (plusp (length bin)))
+      ;; BIN decides alone, and is returned as given.
+      (and (%file-p (uiop:parse-native-namestring bin)) bin)
+      (let ((windows (stack-process:windows-p)))
+        (dolist (entry (uiop:split-string (or path "") :separator (if windows ";" ":")) nil)
+          (when (plusp (length entry))
+            (let ((directory (uiop:ensure-directory-pathname (uiop:parse-native-namestring entry))))
+              (dolist (name +musescore-names+)
+                (let ((candidate (merge-pathnames (if windows (concatenate 'string name ".exe") name)
+                                                  directory)))
+                  (when (%file-p candidate)
+                    (return-from find-musescore (uiop:native-namestring candidate)))))))))))
 
 (defun musescore-convert (input output &key (musescore (find-musescore)) (timeout 300))
   "Convert INPUT to OUTPUT with MuseScore; OUTPUT, or ORACLE-FAILED (file header)."
-  (declare (ignore input output musescore timeout))
-  (%sc5-pending 'musescore-convert))
+  (check-type musescore string)
+  (check-type input pathname)
+  (check-type output pathname)
+  (multiple-value-bind (code stdout stderr)
+      (stack-process:run (list musescore "-o" (uiop:native-namestring output)
+                               (uiop:native-namestring input))
+                         :output nil :error-output :string :timeout timeout
+                         :env (unless (uiop:getenv "QT_QPA_PLATFORM")
+                                (list (cons "QT_QPA_PLATFORM" "offscreen"))))
+    (declare (ignore stdout))
+    (unless (and (eql code 0) (%file-p output))
+      (error 'oracle-failed :tool "MuseScore" :exit-code code :output stderr))
+    output))
+
+(defun %xmllint-p ()
+  "True when xmllint runs here (file header, MUSICXML-SCHEMA)."
+  (handler-case (eql 0 (stack-process:run '("xmllint" "--version") :output nil :error-output nil))
+    ;; No xmllint: the header makes this NIL.
+    (stack-process:process-error () nil)))
 
 (defun musicxml-schema (&key (xsd (uiop:getenv "MUSICXML_XSD")))
   "(xsd catalog) when the MusicXML 4.0 schema and xmllint are at hand, else NIL
 (file header)."
-  (declare (ignore xsd))
-  (%sc5-pending 'musicxml-schema))
+  (let ((file (and (stringp xsd) (plusp (length xsd)) (uiop:parse-native-namestring xsd))))
+    ;; NIL, "" and a missing file answer NIL before xmllint runs.
+    (when (and file (%file-p file) (%xmllint-p))
+      (let* ((truename (truename file))
+             (catalog (make-pathname :name "catalog" :type "xml" :defaults truename)))
+        (list (uiop:native-namestring truename)
+              (and (%file-p catalog) (uiop:native-namestring (truename catalog))))))))
 
 (defun xmllint-validate (text schema)
   "(values valid-p message): TEXT validated against SCHEMA by xmllint (file header)."
-  (declare (ignore text schema))
-  (%sc5-pending 'xmllint-validate))
+  (check-type text string)
+  (check-type schema (cons string (cons (or null string) null)) "a list MUSICXML-SCHEMA returned")
+  (destructuring-bind (xsd catalog) schema
+    (multiple-value-bind (code stdout stderr)
+        (stack-process:run (list "xmllint" "--nonet" "--noout" "--schema" xsd "-")
+                           :input text :output nil :error-output :string
+                           :env (and catalog (list (cons "XML_CATALOG_FILES" catalog))))
+      (declare (ignore stdout))
+      (if (eql code 0)
+          (values t nil)
+          (values nil (string-trim '(#\Space #\Tab #\Newline #\Return #\Page) stderr))))))

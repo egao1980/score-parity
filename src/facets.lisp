@@ -101,40 +101,213 @@
 (defparameter +content-facets+ '(:notes :spelled :lyrics :verse-1 :chord-symbols :bars)
   "Every facet of CONTENT-FACET, in comparison order (file header). Data.")
 
+;;; Walking voices (internal) -------------------------------------------------------
+
+(defun %voices (score)
+  "Every voice of SCORE in document order: the parts in order, each part's
+PART-VOICES in order (file header, Voices)."
+  (loop for part in (fset:convert 'list (score-protocol:score-parts score))
+        append (score-protocol:part-voices part)))
+
+(defun %voice-measures (voice)
+  "VOICE's voice measures, as a fresh list of fresh lists of events."
+  (mapcar (lambda (measure) (fset:convert 'list measure))
+          (fset:convert 'list (score-protocol:voice-measures voice))))
+
+(defun %grace-p (event)
+  "True for a grace event. EVENT-GRACE is a SOUNDING-EVENT reader: a rest has none."
+  (and (typep event 'score-protocol:sounding-event)
+       (score-protocol:event-grace event)
+       t))
+
+(defun %event-notes (event)
+  "The notes of EVENT: a NOTE-EVENT is its own one note, a CHORD-EVENT has its
+CHORD-EVENT-NOTES in order, a rest has none (file header, Timed events)."
+  (typecase event
+    (score-protocol:note-event (list event))
+    (score-protocol:chord-event (score-protocol:chord-event-notes event))
+    (t '())))
+
+(defun %key (note)
+  (music-theory:pitch-midi (score-protocol:note-pitch note)))
+
+(defun %by-onset-then (index)
+  "A predicate ordering rows by their first element, then by element INDEX."
+  (lambda (a b)
+    (or (< (first a) (first b))
+        (and (= (first a) (first b)) (< (nth index a) (nth index b))))))
+
+(defun %timed-events (score voice)
+  "VOICE's timed events, a simple-vector of (onset . event): grace events left
+out, ONSET its bar's start plus the durations of the timed events before it in
+its voice measure (file header, Timed events)."
+  (let ((timed '()))
+    (loop for events in (%voice-measures voice)
+          for bar from (score-protocol:score-first-bar score)
+          do (let ((onset nil))          ; BAR-START only for a measure with a timed event
+               (dolist (event events)
+                 (unless (%grace-p event)
+                   (unless onset
+                     (setf onset (score-protocol:bar-start score bar)))
+                   (push (cons onset event) timed)
+                   (incf onset (score-protocol:event-duration event))))))
+    (coerce (nreverse timed) 'simple-vector)))
+
+(defun %voice-rows (timed)
+  "The (onset end key pitch) row of every tie chain of TIMED, a vector of
+%TIMED-EVENTS, sorted by onset, then key, stably (file header, Sounding notes)."
+  (let ((taken (make-array (length timed) :initial-element '())) ; per slot: notes joined to a chain
+        (rows '()))
+    (loop for i from 0
+          for (onset . event) across timed
+          do (dolist (head (%event-notes event))
+               (unless (member head (svref taken i) :test #'eq)
+                 (let ((key (%key head))
+                       (end (+ onset (score-protocol:event-duration event)))
+                       (tail head)
+                       (j i))
+                   (loop for tie = (score-protocol:note-tie tail)
+                         while (and tie (< (1+ j) (length timed)))
+                         do (destructuring-bind (next-onset . next) (svref timed (1+ j))
+                              (let ((note (find (score-protocol:tie-end tie) (%event-notes next)
+                                                :key #'score-protocol:element-id :test #'equal)))
+                                (unless (and note (= next-onset end) (= key (%key note)))
+                                  (loop-finish)) ; the chain stops; the tie is ignored
+                                (incf j)
+                                (push note (svref taken j))
+                                (incf end (score-protocol:event-duration next))
+                                (setf tail note))))
+                   (push (list onset end key
+                               (music-theory:pitch-name (score-protocol:note-pitch head)))
+                         rows)))))
+    (stable-sort (nreverse rows) (%by-onset-then 2))))
+
+(defun %lyric-rows (timed)
+  "The (onset verse text syllabic) rows of TIMED, sorted by onset, then verse,
+stably (file header, LYRIC-LINES)."
+  (stable-sort
+   (loop for (onset . event) across timed
+         when (typep event '(or score-protocol:note-event score-protocol:chord-event))
+           append (mapcar (lambda (lyric)
+                            (list onset
+                                  (score-protocol:lyric-verse lyric)
+                                  (score-protocol:lyric-text lyric)
+                                  (score-protocol:lyric-syllabic lyric)))
+                          (score-protocol:event-lyrics event)))
+   (%by-onset-then 1)))
+
+(defun %sounding-voices (score)
+  "(timed . rows) for every voice of SCORE that has at least one row, in document
+order: VOICE-LINES and LYRIC-LINES both read this list, so they line up."
+  (loop for voice in (%voices score)
+        for timed = (%timed-events score voice)
+        for rows = (%voice-rows timed)
+        when rows collect (cons timed rows)))
+
+;;; The facets ----------------------------------------------------------------------
+
 (defun voice-lines (score)
   "The sounding notes of every voice that sounds, as rows (onset end key pitch)
 (file header)."
-  (declare (ignore score))
-  (%sc5-pending 'voice-lines))
+  (mapcar #'cdr (%sounding-voices score)))
 
 (defun lyric-lines (score)
   "The lyrics of the voices of VOICE-LINES, as rows (onset verse text syllabic)
 (file header)."
-  (declare (ignore score))
-  (%sc5-pending 'lyric-lines))
+  (mapcar (lambda (voice) (%lyric-rows (car voice))) (%sounding-voices score)))
 
 (defun chord-symbol-rows (score)
   "The chord-symbol anchors as rows (onset text) (file header)."
-  (declare (ignore score))
-  (%sc5-pending 'chord-symbol-rows))
+  (stable-sort
+   (mapcar (lambda (anchor)
+             (list (score-protocol:absolute-offset score (score-protocol:anchor-position anchor))
+                   (music-theory:print-chord-symbol (score-protocol:anchor-symbol anchor)
+                                                    :dialect :pop)))
+           (fset:convert 'list (score-protocol:score-chord-symbols score)))
+   #'< :key #'first))
 
 (defun bar-lengths (score)
   "The length of every bar, in order (file header)."
-  (declare (ignore score))
-  (%sc5-pending 'bar-lengths))
+  ;; No measures: first bar 1, last bar 0 (score-protocol measure-map.lisp), so ().
+  (loop for bar from (score-protocol:score-first-bar score)
+          to (score-protocol:score-last-bar score)
+        collect (score-protocol:bar-length score bar)))
+
+(defun %shared-staff-p (part)
+  "True when two voices of PART on one VOICE-STAFF both hold an event in some
+voice measure k (file header, :SHARED-STAFF)."
+  (let ((held (make-hash-table :test 'equal))) ; (staff . k) -> T once a voice holds an event there
+    (some (lambda (voice)
+            (loop for events in (%voice-measures voice)
+                  for k from 0
+                  thereis (and events
+                               (shiftf (gethash (cons (score-protocol:voice-staff voice) k) held)
+                                       t))))
+          (score-protocol:part-voices part))))
 
 (defun score-features (score)
   "The keywords of +FEATURES+ that SCORE has (file header)."
-  (declare (ignore score))
-  (%sc5-pending 'score-features))
+  (let* ((parts (fset:convert 'list (score-protocol:score-parts score)))
+         (measures (fset:convert 'list (score-protocol:score-measure-map score)))
+         (anchors (fset:convert 'list (score-protocol:score-chord-symbols score)))
+         (events (loop for voice in (%voices score) ; grace events and rests included
+                       append (loop for events in (%voice-measures voice) append events)))
+         (notes (loop for event in events append (%event-notes event)))
+         (lyrics (loop for event in events append (score-protocol:event-lyrics event))))
+    (flet ((has-p (feature)
+             ;; One small predicate per line of the file header.
+             (ecase feature
+               (:lyrics lyrics)
+               (:verses (some (lambda (lyric) (<= 2 (score-protocol:lyric-verse lyric))) lyrics))
+               (:chord-symbols anchors)
+               (:lead-sheet (and anchors
+                                 (= 1 (length parts))
+                                 (= 1 (length (score-protocol:part-voices (first parts))))))
+               (:pickup (and measures (score-protocol:measure-info-pickup-p (first measures))))
+               (:repeats (some #'score-protocol:measure-info-repeat-end measures))
+               (:endings (some #'score-protocol:measure-info-ending measures))
+               (:jumps (some #'score-protocol:measure-info-jump measures))
+               (:ties (some #'score-protocol:note-tie notes))
+               (:tuplets (some #'score-protocol:event-tuplet events))
+               (:grace-notes (some #'%grace-p events))
+               (:key-change (some #'score-protocol:measure-info-key (rest measures)))
+               (:meter-change (some #'score-protocol:measure-info-time (rest measures)))
+               (:shared-staff (some #'%shared-staff-p parts))
+               (:parts (<= 2 (length parts))))))
+      ;; A fresh list in +FEATURES+ order, never +FEATURES+ itself.
+      (loop for feature in +features+
+            when (has-p feature) collect feature))))
+
+(defun %content-facet-p (object)
+  (and (member object +content-facets+) t))
+
+(defun %columns (lines &rest places)
+  "Each row of each line of LINES reduced to its elements at PLACES."
+  (mapcar (lambda (line)
+            (mapcar (lambda (row) (mapcar (lambda (place) (nth place row)) places)) line))
+          lines))
 
 (defun content-facet (score facet)
   "The FACET view of SCORE's content (file header)."
-  (declare (ignore score facet))
-  (%sc5-pending 'content-facet))
+  (check-type facet (satisfies %content-facet-p) "a facet of +CONTENT-FACETS+")
+  (ecase facet
+    (:notes (%columns (voice-lines score) 0 1 2))
+    (:spelled (%columns (voice-lines score) 0 1 3))
+    (:lyrics (lyric-lines score))
+    (:verse-1 (mapcar (lambda (line)
+                        (loop for (onset verse text syllabic) in line
+                              when (eql verse 1)
+                                collect (list onset text
+                                              (and (member syllabic '(:begin :middle)) t))))
+                      (lyric-lines score)))
+    (:chord-symbols (chord-symbol-rows score))
+    (:bars (bar-lengths score))))
 
 (defun content-differences (a b &key (facets +content-facets+))
   "(facet value-a value-b) for each facet of FACETS on which A and B differ
 (file header)."
-  (declare (ignore a b facets))
-  (%sc5-pending 'content-differences))
+  (loop for facet in facets
+        for value-a = (content-facet a facet)
+        for value-b = (content-facet b facet)
+        unless (equal value-a value-b)
+          collect (list facet value-a value-b)))

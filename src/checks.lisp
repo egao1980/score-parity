@@ -115,47 +115,170 @@
   "The corpus PIECE as READ-MUSICXML reads it (given)."
   (call-backend :musicxml "READ-MUSICXML" (corpus-path piece) :split-voices split-voices))
 
+;;; Internal helpers ----------------------------------------------------------------
+
+(defun %lossless (thunk)
+  "THUNK's values, each SCORE-PROTOCOL:LOSSY-CONVERSION muffled with MUFFLE-WARNING.
+No other condition is handled: LOW-CONFIDENCE-GUESS, which is SIGNALled, is
+declined (file header)."
+  (handler-bind ((score-protocol:lossy-conversion #'muffle-warning))
+    (funcall thunk)))
+
+(defun %result (check piece status &optional reason differences)
+  (make-parity-result :check check :piece piece :status status :reason reason
+                      :differences differences))
+
+(defun %differences-result (check piece what differences)
+  ":PASS when DIFFERENCES is (), else :FAIL with REASON \"WHAT differs in F, ...\"
+naming their facets in lower case (file header, :MIDI)."
+  (if differences
+      (%result check piece :fail
+               (format nil "~A differs in ~{~(~S~)~^, ~}" what (mapcar #'first differences))
+               differences)
+      (%result check piece :pass)))
+
+;;; The checks ----------------------------------------------------------------------
+;;; A later artifact is made only once the earlier test passed: the first :FAIL
+;;; that applies is reported, never an error from an artifact it doesn't need.
+
 (defun check-musicxml (piece)
   "MusicXML read -> write -> read, byte-stable (file header)."
-  (declare (ignore piece))
-  (%sc5-pending 'check-musicxml))
+  (%lossless
+   (lambda ()
+     (let* ((s (read-piece piece))
+            (t1 (call-backend :musicxml "WRITE-MUSICXML" s))
+            (s2 (call-backend :musicxml "READ-MUSICXML" t1))) ; a string is MusicXML text
+       (if (not (score-protocol:score-equal s s2))
+           (%result :musicxml piece :fail "read, write, read is not SCORE-EQUAL"
+                    (content-differences s s2))
+           (let ((t2 (call-backend :musicxml "WRITE-MUSICXML" s2)))
+             (if (string= t1 t2)
+                 (%result :musicxml piece :pass)
+                 (%result :musicxml piece :fail
+                          (format nil "the second write differs from the first at character ~D"
+                                  (mismatch t1 t2))))))))))
+
+(defun %check-archive (piece s)
+  "The corpus archive step of CHECK-MXL: A against S, for an ARCHIVE-PIECE."
+  (if (member piece (archive-pieces) :test #'equal)
+      (let ((a (call-backend :musicxml "READ-MXL" (corpus-path piece "mxl"))))
+        (if (score-protocol:score-equal s a)
+            (%result :mxl piece :pass)
+            (%result :mxl piece :fail
+                     (format nil "corpus/~A.mxl does not read as corpus/~A.musicxml" piece piece)
+                     (content-differences s a))))
+      (%result :mxl piece :pass)))
 
 (defun check-mxl (piece)
   ".mxl write -> read, byte-stable, and the corpus archive (file header)."
-  (declare (ignore piece))
-  (%sc5-pending 'check-mxl))
+  (%lossless
+   (lambda ()
+     (let* ((s (read-piece piece))
+            (o1 (call-backend :musicxml "WRITE-MXL" s))
+            (s3 (call-backend :musicxml "READ-MXL" o1)))
+       (if (not (score-protocol:score-equal s s3))
+           (%result :mxl piece :fail "write-mxl, read-mxl is not SCORE-EQUAL"
+                    (content-differences s s3))
+           (let ((o2 (call-backend :musicxml "WRITE-MXL" s3)))
+             (if (equalp o1 o2)        ; octet vectors: EQUAL compares them by identity
+                 (%check-archive piece s)
+                 (%result :mxl piece :fail
+                          (format nil "the second archive differs from the first at byte ~D"
+                                  (mismatch o1 o2))))))))))
 
 (defun check-hymnal-split (piece)
   "The hymnal voice split gives the four voice lines (file header)."
-  (declare (ignore piece))
-  (%sc5-pending 'check-hymnal-split))
+  ;; The facts first: a piece with none is UNKNOWN-PIECE, not "not a hymn".
+  (let ((expected (piece-fact piece :split-lines)))
+    (if (null expected)
+        (%result :hymnal-split piece :skip "not a hymn")
+        (let ((lines (%lossless
+                      (lambda () (voice-lines (read-piece piece :split-voices :auto))))))
+          (if (equal lines expected)
+              (%result :hymnal-split piece :pass)
+              (%result :hymnal-split piece :fail
+                       (if (/= (length lines) (length expected))
+                           (format nil "~D voice lines, not ~D" (length lines) (length expected))
+                           (format nil "voice line ~D differs"
+                                   (1+ (mismatch lines expected :test #'equal))))
+                       (list (list :split-lines expected lines))))))))
 
 (defun check-midi (piece)
   "score -> MIDI -> score as written (file header)."
-  (declare (ignore piece))
-  (%sc5-pending 'check-midi))
+  (%lossless
+   (lambda ()
+     (let* ((s (read-piece piece))
+            (m (call-backend :midi "IMPORT-MIDI"
+                             (call-backend :midi "EXPORT-MIDI" s nil :unfold nil))))
+       (%differences-result :midi piece "score, MIDI, score"
+                            (content-differences s m :facets +midi-facets+))))))
 
 (defun check-midi-unfold (piece)
   "score -> MIDI -> score unfolded (file header)."
-  (declare (ignore piece))
-  (%sc5-pending 'check-midi-unfold))
+  (%lossless
+   (lambda ()
+     (let* ((s (read-piece piece))
+            (m (call-backend :midi "IMPORT-MIDI" (call-backend :midi "EXPORT-MIDI" s nil)))
+            (u (values (score-protocol:unfold s)))) ; the view: id map and passes dropped
+       (%differences-result :midi-unfold piece "score, MIDI, score"
+                            (content-differences u m :facets +midi-facets+))))))
 
 (defun check-musescore (piece &key (musescore (find-musescore)))
   "Our MusicXML through MuseScore and back, within the tolerance (file header)."
-  (declare (ignore piece musescore))
-  (%sc5-pending 'check-musescore))
+  (if (null musescore)
+      (%result :musescore piece :skip
+               "MuseScore not found: set MUSESCORE_BIN, or put mscore, musescore or MuseScore4 on PATH")
+      (%lossless
+       (lambda ()
+         (let ((s (read-piece piece)))
+           (cl-stack-pathlib:with-temp-directory (tmp :prefix "score-parity-")
+             (let* ((directory (uiop:ensure-directory-pathname (cl-stack-pathlib:path-pathname tmp)))
+                    (in (make-pathname :name "in" :type "musicxml" :defaults directory))
+                    (out (make-pathname :name "out" :type "musicxml" :defaults directory)))
+               ;; To a pathname, WRITE-MUSICXML writes UTF-8.
+               (call-backend :musicxml "WRITE-MUSICXML" s in)
+               (musescore-convert in out :musescore musescore)
+               ;; OUT stays a pathname: a string would be read as MusicXML text.
+               (let ((r (call-backend :musicxml "READ-MUSICXML" out :unsupported :skip)))
+                 (%differences-result :musescore piece "MuseScore's re-export"
+                                      (content-differences s r :facets +musescore-facets+))))))))))
 
 (defun check-xsd (piece &key (schema (musicxml-schema)))
   "Our MusicXML against the MusicXML 4.0 XSD (file header)."
-  (declare (ignore piece schema))
-  (%sc5-pending 'check-xsd))
+  (if (null schema)
+      (%result :xsd piece :skip "MUSICXML_XSD unset, or xmllint missing")
+      (%lossless
+       (lambda ()
+         (multiple-value-bind (valid message)
+             (xmllint-validate (call-backend :musicxml "WRITE-MUSICXML" (read-piece piece)) schema)
+           (if valid
+               (%result :xsd piece :pass)
+               (%result :xsd piece :fail message)))))))
+
+;;; Running checks ------------------------------------------------------------------
+
+(defun %check-p (object)
+  (and (assoc object +checks+) t))
+
+(defun %check-function (check)
+  "The FUNCTION of CHECK in +CHECKS+: a symbol, called through its global
+definition at call time."
+  (getf (cdr (assoc check +checks+)) :function))
 
 (defun check-applies-p (check piece)
   "True when CHECK runs on PIECE in the matrix (file header)."
-  (declare (ignore check piece))
-  (%sc5-pending 'check-applies-p))
+  (check-type check (satisfies %check-p) "a check of +CHECKS+")
+  (if (eq check :hymnal-split)
+      (and (member piece (hymn-pieces) :test #'equal) t)
+      t))
 
 (defun run-check (check piece &rest keys)
   "CHECK on PIECE, its errors reported as results (file header)."
-  (declare (ignore check piece keys))
-  (%sc5-pending 'run-check))
+  ;; Outside the HANDLER-CASE: an unknown CHECK is the caller's TYPE-ERROR.
+  (check-type check (satisfies %check-p) "a check of +CHECKS+")
+  (handler-case (apply (%check-function check) piece keys)
+    ;; BACKEND-MISSING is an ERROR: its clause comes first.
+    (backend-missing (condition)
+      (%result check piece :skip (princ-to-string condition)))
+    (error (condition)
+      (%result check piece :error (princ-to-string condition)))))

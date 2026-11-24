@@ -58,8 +58,3 @@ the result per notation feature.")
    #:parity-matrix #:matrix-cells #:print-matrix))
 
 (in-package #:score-parity)
-
-(defun %sc5-pending (name)
-  "Contract stub for slice SC5. Every call is replaced by the implementation,
-then this function is deleted."
-  (error "score-parity SC5 pending: ~A" name))
